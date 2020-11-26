@@ -76,11 +76,6 @@ template <u32 EntriesArraySize = 32U, u32 DefaultMaxEntriesCount = 32U,
           s32 MaxReleaseToOsIntervalMs = INT32_MAX>
 class MapAllocatorCache {
 public:
-  // Fuchsia doesn't allow releasing Secondary blocks yet. Note that 0 length
-  // arrays are an extension for some compilers.
-  // FIXME(kostyak): support (partially) the cache on Fuchsia.
-  static_assert(!SCUDO_FUCHSIA || EntriesArraySize == 0U, "");
-
   // Ensure the default maximum specified fits the array.
   static_assert(DefaultMaxEntriesCount <= EntriesArraySize, "");
 
@@ -100,7 +95,7 @@ public:
     bool EntryCached = false;
     bool EmptyCache = false;
     const u64 Time = getMonotonicTime();
-    const u32 MaxCount = atomic_load(&MaxEntriesCount, memory_order_relaxed);
+    const u32 MaxCount = atomic_load_relaxed(&MaxEntriesCount);
     {
       ScopedLock L(Mutex);
       if (EntriesCount >= MaxCount) {
@@ -127,15 +122,14 @@ public:
     s32 Interval;
     if (EmptyCache)
       empty();
-    else if ((Interval = atomic_load(&ReleaseToOsIntervalMs,
-                                     memory_order_relaxed)) >= 0)
+    else if ((Interval = atomic_load_relaxed(&ReleaseToOsIntervalMs)) >= 0)
       releaseOlderThan(Time - static_cast<u64>(Interval) * 1000000);
     return EntryCached;
   }
 
   bool retrieve(uptr Size, LargeBlock::Header **H, bool *Zeroed) {
     const uptr PageSize = getPageSizeCached();
-    const u32 MaxCount = atomic_load(&MaxEntriesCount, memory_order_relaxed);
+    const u32 MaxCount = atomic_load_relaxed(&MaxEntriesCount);
     ScopedLock L(Mutex);
     if (EntriesCount == 0)
       return false;
@@ -161,8 +155,8 @@ public:
   }
 
   bool canCache(uptr Size) {
-    return atomic_load(&MaxEntriesCount, memory_order_relaxed) != 0U &&
-           Size <= atomic_load(&MaxEntrySize, memory_order_relaxed);
+    return atomic_load_relaxed(&MaxEntriesCount) != 0U &&
+           Size <= atomic_load_relaxed(&MaxEntrySize);
   }
 
   bool setOption(Option O, sptr Value) {
@@ -170,17 +164,16 @@ public:
       const s32 Interval =
           Max(Min(static_cast<s32>(Value), MaxReleaseToOsIntervalMs),
               MinReleaseToOsIntervalMs);
-      atomic_store(&ReleaseToOsIntervalMs, Interval, memory_order_relaxed);
+      atomic_store_relaxed(&ReleaseToOsIntervalMs, Interval);
       return true;
     } else if (O == Option::MaxCacheEntriesCount) {
       const u32 MaxCount = static_cast<u32>(Value);
       if (MaxCount > EntriesArraySize)
         return false;
-      atomic_store(&MaxEntriesCount, MaxCount, memory_order_relaxed);
+      atomic_store_relaxed(&MaxEntriesCount, MaxCount);
       return true;
     } else if (O == Option::MaxCacheEntrySize) {
-      atomic_store(&MaxEntrySize, static_cast<uptr>(Value),
-                   memory_order_relaxed);
+      atomic_store_relaxed(&MaxEntrySize, static_cast<uptr>(Value));
       return true;
     }
     // Not supported by the Secondary Cache, but not an error either.
@@ -267,7 +260,7 @@ public:
   }
 
   void *allocate(uptr Size, uptr AlignmentHint = 0, uptr *BlockEnd = nullptr,
-                 bool ZeroContents = false);
+                 FillContentsMode FillContents = NoFill);
 
   void deallocate(void *Ptr);
 
@@ -328,7 +321,8 @@ private:
 // (pending rounding and headers).
 template <class CacheT>
 void *MapAllocator<CacheT>::allocate(uptr Size, uptr AlignmentHint,
-                                     uptr *BlockEnd, bool ZeroContents) {
+                                     uptr *BlockEnd,
+                                     FillContentsMode FillContents) {
   DCHECK_GE(Size, AlignmentHint);
   const uptr PageSize = getPageSizeCached();
   const uptr RoundedSize =
@@ -342,8 +336,9 @@ void *MapAllocator<CacheT>::allocate(uptr Size, uptr AlignmentHint,
         *BlockEnd = H->BlockEnd;
       void *Ptr = reinterpret_cast<void *>(reinterpret_cast<uptr>(H) +
                                            LargeBlock::getHeaderSize());
-      if (ZeroContents && !Zeroed)
-        memset(Ptr, 0, H->BlockEnd - reinterpret_cast<uptr>(Ptr));
+      if (FillContents && !Zeroed)
+        memset(Ptr, FillContents == ZeroFill ? 0 : PatternFillByte,
+               H->BlockEnd - reinterpret_cast<uptr>(Ptr));
       const uptr BlockSize = H->BlockEnd - reinterpret_cast<uptr>(H);
       {
         ScopedLock L(Mutex);
@@ -393,9 +388,9 @@ void *MapAllocator<CacheT>::allocate(uptr Size, uptr AlignmentHint,
   }
 
   const uptr CommitSize = MapEnd - PageSize - CommitBase;
-  const uptr Ptr =
-      reinterpret_cast<uptr>(map(reinterpret_cast<void *>(CommitBase),
-                                 CommitSize, "scudo:secondary", 0, &Data));
+  const uptr Ptr = reinterpret_cast<uptr>(
+      map(reinterpret_cast<void *>(CommitBase), CommitSize, "scudo:secondary",
+          MAP_RESIZABLE, &Data));
   LargeBlock::Header *H = reinterpret_cast<LargeBlock::Header *>(Ptr);
   H->MapBase = MapBase;
   H->MapSize = MapEnd - MapBase;
